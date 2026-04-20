@@ -73,6 +73,7 @@ explanation = explainer.explain_instance(
 print(explanation.as_list())
 chunks_df = pd.read_csv('./data/discharge/test.csv')
 
+results = []
 for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME explanations"):
     chunk_text = row['TEXT']
     
@@ -82,5 +83,7 @@ for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME expl
         num_features=20,
         num_samples=1000
     )
-    
-    weights = dict(explanation.as_list())
+    results.append(dict(explanation.as_list()))
+weights = dict(explanation.as_list())
+df_results = pd.DataFrame(results)
+df_results.to_csv('lime_gender_weights.csv', index=False)
