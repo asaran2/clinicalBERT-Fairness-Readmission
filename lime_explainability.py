@@ -78,7 +78,7 @@ for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME expl
     chunk_text = row['TEXT']
     
     explanation = explainer.explain_instance(
-        "chunk_text",
+        chunk_text,
         predictor_function,
         num_features=20,
         num_samples=1000
