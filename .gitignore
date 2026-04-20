@@ -1,0 +1,9 @@
+.venv/
+model/
+data/
+__pycache__/
+discharge_clinicalBERT.zip
+result_discharge*/
+outputs/
+*.pyc
+.DS_Store
