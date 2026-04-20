@@ -83,7 +83,7 @@ for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME expl
         num_features=20,
         num_samples=1000
     )
-    results.append(dict(explanation.as_list()))
-weights = dict(explanation.as_list())
+    results.append({'chunk_idx': idx, 'weights': str(explanation.as_list())})
+
 df_results = pd.DataFrame(results)
 df_results.to_csv('lime_gender_weights.csv', index=False)
