@@ -73,30 +73,47 @@ inputDir = "/content/drive/MyDrive/NarrativeGuard/Final_Code_Dataset/dataSplit_1
 outputDir = "/content/drive/MyDrive/NarrativeGuard/Final_Code_Dataset/lime_1_1000"
 csv_files = glob.glob(os.path.join(inputDir, "*.csv"))
 
+os.makedirs(outputDir, exist_ok=True)
+
 for file_path in csv_files:
     chunks_df = pd.read_csv(file_path)
-    results = []
-    for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME explanations"):
-        chunk_text = row['mimic_text']
-        
-        explanation = explainer.explain_instance(
-            chunk_text,
-            predictor_function,
-            num_features=20,
-            num_samples=1000
-        )
-        p_readmit = explanation.predict_proba[1]  # stored from LIME's initial call
-
-        results.append({
-            'chunk_idx': idx,
-            'hadm_id': row['hadm_id'],
-            'true_label': row['true_label'],
-            'bert_prob_readmit': round(p_readmit, 4),
-            'bert_prediction': 1 if p_readmit >= 0.5 else 0,
-            'weights': str(explanation.as_list())
-        })
-
-    df_results = pd.DataFrame(results)
     file_name = os.path.basename(file_path)
     output_path = os.path.join(outputDir, f"processed_{file_name}")
+    results = []
+
+    for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc=f"LIME: {file_name}"):
+        chunk_text = row['mimic_text']
+
+        # Skip empty/NaN rows
+        if pd.isna(chunk_text) or str(chunk_text).strip() == '':
+            continue
+
+        try:
+            explanation = explainer.explain_instance(
+                str(chunk_text),
+                predictor_function,
+                num_features=20,
+                num_samples=1000
+            )
+            p_readmit = explanation.predict_proba[1]
+
+            results.append({
+                'chunk_idx': idx,
+                'hadm_id': row['hadm_id'],
+                'true_label': row['true_label'],
+                'bert_prob_readmit': round(p_readmit, 4),
+                'bert_prediction': 1 if p_readmit >= 0.5 else 0,
+                'weights': str(explanation.as_list())
+            })
+        except Exception as e:
+            print(f"Error on chunk {idx}: {e}")
+            continue
+
+        # Save progress every 50 chunks (so you don't lose everything on crash)
+        if len(results) % 50 == 0:
+            pd.DataFrame(results).to_csv(output_path, index=False)
+
+    # Final save
+    df_results = pd.DataFrame(results)
     df_results.to_csv(output_path, index=False)
+    print(f"Saved {len(results)} results to {output_path}")
