@@ -19,6 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import csv
+import json
 import os
 import logging
 import argparse
@@ -113,11 +114,13 @@ class DataProcessor(object):
     def _read_csv(cls, input_file):
         """Reads a comma separated value file."""
         file=pd.read_csv(input_file)
+        if 'cleaned_text' in file.columns:
+            file = file.rename(columns={'cleaned_text': 'TEXT'})
         nan_rows = file[file.TEXT.isna()]
         if not nan_rows.empty:
-            print("SUBJECT_IDs with NaN TEXT:", nan_rows.SUBJECT_ID.tolist())
+            print("hospital admissionIds with NaN TEXT:", nan_rows.HADM_ID.tolist())
         file=file.dropna(subset=['TEXT'])
-        lines=zip(file.SUBJECT_ID,file.TEXT,file.OUTPUT_LABEL)
+        lines=zip(file.HADM_ID,file.TEXT,file.OUTPUT_LABEL)
         return lines
 
 class readmissionProcessor(DataProcessor):
@@ -158,7 +161,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         label_map[label] = i
 
     features = []
-    for (ex_index, example) in enumerate(examples):
+    for (ex_index, example) in enumerate(tqdm(examples, desc="Tokenizing")):
         tokens_a = tokenizer.tokenize(example.text_a)
 
         tokens_b = None
@@ -298,10 +301,10 @@ def set_optimizer_params_grad(named_params_optimizer, named_params_model, test_n
 
 def vote_score(df, score, args):
     df['pred_score'] = score
-    df_sort = df.sort_values(by=['SUBJECT_ID'])
+    df_sort = df.sort_values(by=['HADM_ID'])
     #score
-    temp = (df_sort.groupby(['SUBJECT_ID'])['pred_score'].agg(max)+df_sort.groupby(['SUBJECT_ID'])['pred_score'].agg(sum)/2)/(1+df_sort.groupby(['SUBJECT_ID'])['pred_score'].agg(len)/2)
-    x = df_sort.groupby(['SUBJECT_ID'])['OUTPUT_LABEL'].agg(np.min).values
+    temp = (df_sort.groupby(['HADM_ID'])['pred_score'].agg(max)+df_sort.groupby(['HADM_ID'])['pred_score'].agg(sum)/2)/(1+df_sort.groupby(['HADM_ID'])['pred_score'].agg(len)/2)
+    x = df_sort.groupby(['HADM_ID'])['OUTPUT_LABEL'].agg(np.min).values
     df_out = pd.DataFrame({'logits': temp.values, 'ID': x})
 
     fpr, tpr, thresholds = roc_curve(x, temp.values)
@@ -345,10 +348,10 @@ def pr_curve_plot(y, y_score, args):
 
 def vote_pr_curve(df, score, args):
     df['pred_score'] = score
-    df_sort = df.sort_values(by=['SUBJECT_ID'])
+    df_sort = df.sort_values(by=['HADM_ID'])
     #score
-    temp = (df_sort.groupby(['SUBJECT_ID'])['pred_score'].agg(max)+df_sort.groupby(['SUBJECT_ID'])['pred_score'].agg(sum)/2)/(1+df_sort.groupby(['SUBJECT_ID'])['pred_score'].agg(len)/2)
-    y = df_sort.groupby(['SUBJECT_ID'])['OUTPUT_LABEL'].agg(np.min).values
+    temp = (df_sort.groupby(['HADM_ID'])['pred_score'].agg(max)+df_sort.groupby(['HADM_ID'])['pred_score'].agg(sum)/2)/(1+df_sort.groupby(['HADM_ID'])['pred_score'].agg(len)/2)
+    y = df_sort.groupby(['HADM_ID'])['OUTPUT_LABEL'].agg(np.min).values
     
     precision, recall, thres = precision_recall_curve(y, temp)
     pr_thres = pd.DataFrame(data =  list(zip(precision, recall, thres)), columns = ['prec','recall','thres'])
@@ -414,7 +417,7 @@ def main():
                         type=int,
                         help="Total batch size for training.")
     parser.add_argument("--eval_batch_size",
-                        default=2,
+                        default=32,
                         type=int,
                         help="Total batch size for eval.")
     parser.add_argument("--learning_rate",
@@ -493,7 +496,10 @@ def main():
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir):
-        raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
+        if args.do_eval and os.path.exists(os.path.join(args.output_dir, 'eval_checkpoint.json')):
+            logger.info("Output directory exists but has eval checkpoint — resuming.")
+        else:
+            raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
     os.makedirs(args.output_dir, exist_ok=True)
 
     task_name = args.task_name.lower()
@@ -625,51 +631,99 @@ def main():
     m = nn.Sigmoid()
     if args.do_eval:
         eval_examples = processor.get_test_examples(args.data_dir)
-        eval_features = convert_examples_to_features(
-            eval_examples, label_list, args.max_seq_length, tokenizer)
         logger.info("***** Running evaluation *****")
         logger.info("  Num examples = %d", len(eval_examples))
         logger.info("  Batch size = %d", args.eval_batch_size)
-        all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
-        all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
-        all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
-        all_label_ids = torch.tensor([f.label_id for f in eval_features], dtype=torch.long)
-        eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
-        if args.local_rank == -1:
-            eval_sampler = SequentialSampler(eval_data)
-        else:
-            eval_sampler = DistributedSampler(eval_data)
-        eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
         model.eval()
         eval_loss, eval_accuracy = 0, 0
         nb_eval_steps, nb_eval_examples = 0, 0
         true_labels=[]
         pred_labels=[]
         logits_history=[]
-        for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader):
-            input_ids = input_ids.to(device)
-            input_mask = input_mask.to(device)
-            segment_ids = segment_ids.to(device)
-            label_ids = label_ids.to(device)
-            with torch.no_grad():
-                tmp_eval_loss, temp_logits = model(input_ids, segment_ids, input_mask, label_ids)
-                logits = model(input_ids,segment_ids,input_mask)
-            
-            logits = torch.squeeze(m(logits)).detach().cpu().numpy()
-            label_ids = label_ids.to('cpu').numpy()
 
-            outputs = np.asarray([1 if i else 0 for i in (logits.flatten()>=0.5)])
-            tmp_eval_accuracy=np.sum(outputs == label_ids)
-            
-            true_labels = true_labels + label_ids.flatten().tolist()
-            pred_labels = pred_labels + outputs.flatten().tolist()
-            logits_history = logits_history + logits.flatten().tolist()
-       
-            eval_loss += tmp_eval_loss.mean().item()
-            eval_accuracy += tmp_eval_accuracy
+        # Checkpoint support: resume from last saved chunk if interrupted
+        checkpoint_path = os.path.join(args.output_dir, 'eval_checkpoint.json')
+        start_chunk = 0
+        if os.path.exists(checkpoint_path):
+            with open(checkpoint_path, 'r') as f:
+                ckpt = json.load(f)
+            true_labels = ckpt['true_labels']
+            pred_labels = ckpt['pred_labels']
+            logits_history = ckpt['logits_history']
+            eval_loss = ckpt['eval_loss']
+            eval_accuracy = ckpt['eval_accuracy']
+            nb_eval_steps = ckpt['nb_eval_steps']
+            nb_eval_examples = ckpt['nb_eval_examples']
+            start_chunk = ckpt['next_chunk_start']
+            logger.info("  Resuming from checkpoint at example %d", start_chunk)
 
-            nb_eval_examples += input_ids.size(0)
-            nb_eval_steps += 1
+        # Process in chunks of 10000 to avoid loading everything into memory
+        chunk_size = 10000
+        for chunk_start in range(start_chunk, len(eval_examples), chunk_size):
+            chunk_examples = eval_examples[chunk_start:chunk_start + chunk_size]
+            logger.info("  Processing examples %d to %d", chunk_start, chunk_start + len(chunk_examples))
+
+            eval_features = convert_examples_to_features(
+                chunk_examples, label_list, args.max_seq_length, tokenizer)
+            all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
+            all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
+            all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
+            all_label_ids = torch.tensor([f.label_id for f in eval_features], dtype=torch.long)
+            eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+            if args.local_rank == -1:
+                eval_sampler = SequentialSampler(eval_data)
+            else:
+                eval_sampler = DistributedSampler(eval_data)
+            eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+            for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader):
+                input_ids = input_ids.to(device)
+                input_mask = input_mask.to(device)
+                segment_ids = segment_ids.to(device)
+                label_ids = label_ids.to(device)
+                with torch.no_grad():
+                    tmp_eval_loss, temp_logits = model(input_ids, segment_ids, input_mask, label_ids)
+
+                logits = torch.squeeze(m(temp_logits)).detach().cpu().numpy()
+                label_ids = label_ids.to('cpu').numpy()
+
+                outputs = np.asarray([1 if i else 0 for i in (logits.flatten()>=0.5)])
+                tmp_eval_accuracy=np.sum(outputs == label_ids)
+
+                true_labels = true_labels + label_ids.flatten().tolist()
+                pred_labels = pred_labels + outputs.flatten().tolist()
+                logits_history = logits_history + logits.flatten().tolist()
+
+                eval_loss += tmp_eval_loss.mean().item()
+                eval_accuracy += tmp_eval_accuracy
+
+                nb_eval_examples += input_ids.size(0)
+                nb_eval_steps += 1
+
+            # Save checkpoint after each chunk (atomic write to avoid corruption)
+            tmp_path = checkpoint_path + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump({
+                    'true_labels': true_labels,
+                    'pred_labels': pred_labels,
+                    'logits_history': logits_history,
+                    'eval_loss': float(eval_loss),
+                    'eval_accuracy': float(eval_accuracy),
+                    'nb_eval_steps': int(nb_eval_steps),
+                    'nb_eval_examples': int(nb_eval_examples),
+                    'next_chunk_start': int(chunk_start + chunk_size),
+                }, f)
+            os.replace(tmp_path, checkpoint_path)
+            logger.info("  Checkpoint saved at example %d", chunk_start + chunk_size)
+
+            # Free memory after each chunk
+            del eval_features, all_input_ids, all_input_mask, all_segment_ids, all_label_ids, eval_data
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Clean up checkpoint after successful completion
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
             
         eval_loss = eval_loss / nb_eval_steps
         eval_accuracy = eval_accuracy / nb_eval_examples
@@ -679,6 +733,8 @@ def main():
         df.to_csv(os.path.join(args.output_dir, string))
         
         df_test = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
+        if 'cleaned_text' in df_test.columns:
+            df_test = df_test.rename(columns={'cleaned_text': 'TEXT'})
         df_test = df_test.dropna(subset=['TEXT'])
 
         df_test = df_test.reset_index(drop=True)

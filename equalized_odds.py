@@ -11,7 +11,7 @@ def compute_rates(y_true, y_pred):
 
 
 def main():
-    df = pd.read_csv("result_discharge/output.csv")
+    df = pd.read_csv("/Users/arushisaran/Documents/cs531/groupProject/clinicalBERT-master/result_discharge_1_100000/output.csv")
 
     # Extract gender from clinical text
     df["gender"] = df["TEXT"].str.extract(r"(?i)sex:\s+([mf])", expand=False).str.upper()
