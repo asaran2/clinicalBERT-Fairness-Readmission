@@ -70,14 +70,14 @@ print(explanation.as_list())
 
 inputDir = "/content/drive/MyDrive/NarrativeGuard/Final_Code_Dataset/dataSplit_1_1000_chunked"
 
-outputDir = "/content/drive/MyDrive/NarrativeGuard/Final_Code_Dataset/lime_input_1_1000"
+outputDir = "/content/drive/MyDrive/NarrativeGuard/Final_Code_Dataset/lime_1_1000"
 csv_files = glob.glob(os.path.join(inputDir, "*.csv"))
 
 for file_path in csv_files:
     chunks_df = pd.read_csv(file_path)
     results = []
     for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME explanations"):
-        chunk_text = row['TEXT']
+        chunk_text = row['mimic_text']
         
         explanation = explainer.explain_instance(
             chunk_text,
@@ -89,6 +89,8 @@ for file_path in csv_files:
 
         results.append({
             'chunk_idx': idx,
+            'hadm_id': row['hadm_id'],
+            'true_label': row['true_label'],
             'bert_prob_readmit': round(p_readmit, 4),
             'bert_prediction': 1 if p_readmit >= 0.5 else 0,
             'weights': str(explanation.as_list())
