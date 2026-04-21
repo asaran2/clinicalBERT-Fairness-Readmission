@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 import pandas as pd
+import glob
+import os
 from torch import nn
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 from modeling_readmission import BertForSequenceClassification
@@ -32,31 +34,25 @@ def predictor_function(texts):
     all_probs = []
     with torch.no_grad():
         for text in texts:
-            # Tokenize (same as convert_examples_to_features lines 162-176)
             tokens = tokenizer.tokenize(text)[:510]
             tokens = ['[CLS]'] + tokens + ['[SEP]']
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             segment_ids = [0] * len(input_ids)
             input_mask = [1] * len(input_ids)
             
-            # Pad to 512 (same as lines 220-223)
             pad_len = 512 - len(input_ids)
             input_ids += [0] * pad_len
             segment_ids += [0] * pad_len
             input_mask += [0] * pad_len
             
-            # Convert to tensors (same as lines 633-636, but one example)
             ids = torch.tensor([input_ids]).to(device)
             seg = torch.tensor([segment_ids]).to(device)
             mask = torch.tensor([input_mask]).to(device)
             
-            # Forward pass (same as line 656)
             logit = model(ids, seg, mask)
             
-            # Sigmoid (same as line 658)
             p1 = m(logit).item()
             
-            # LIME needs 2 columns: [P(class 0), P(class 1)]
             all_probs.append([1 - p1, p1])
     
     return np.array(all_probs)
@@ -71,19 +67,34 @@ explanation = explainer.explain_instance(
     num_samples=1000
 )
 print(explanation.as_list())
-chunks_df = pd.read_csv('./data/discharge/test.csv')
 
-results = []
-for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME explanations"):
-    chunk_text = row['TEXT']
-    
-    explanation = explainer.explain_instance(
-        chunk_text,
-        predictor_function,
-        num_features=20,
-        num_samples=1000
-    )
-    results.append({'chunk_idx': idx, 'weights': str(explanation.as_list())})
+inputDir = "/content/drive/MyDrive/NarrativeGuard/Final_Code_Dataset/dataSplit_1_1000_chunked"
 
-df_results = pd.DataFrame(results)
-df_results.to_csv('lime_gender_weights.csv', index=False)
+outputDir = "/content/drive/MyDrive/NarrativeGuard/Final_Code_Dataset/lime_input_1_1000"
+csv_files = glob.glob(os.path.join(inputDir, "*.csv"))
+
+for file_path in csv_files:
+    chunks_df = pd.read_csv(file_path)
+    results = []
+    for idx, row in tqdm(chunks_df.iterrows(), total=len(chunks_df), desc="LIME explanations"):
+        chunk_text = row['TEXT']
+        
+        explanation = explainer.explain_instance(
+            chunk_text,
+            predictor_function,
+            num_features=20,
+            num_samples=1000
+        )
+        p_readmit = explanation.predict_proba[1]  # stored from LIME's initial call
+
+        results.append({
+            'chunk_idx': idx,
+            'bert_prob_readmit': round(p_readmit, 4),
+            'bert_prediction': 1 if p_readmit >= 0.5 else 0,
+            'weights': str(explanation.as_list())
+        })
+
+    df_results = pd.DataFrame(results)
+    file_name = os.path.basename(file_path)
+    output_path = os.path.join(outputDir, f"processed_{file_name}")
+    df_results.to_csv(output_path, index=False)
