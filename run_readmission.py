@@ -114,8 +114,7 @@ class DataProcessor(object):
     def _read_csv(cls, input_file):
         """Reads a comma separated value file."""
         file=pd.read_csv(input_file)
-        if 'cleaned_text' in file.columns:
-            file = file.rename(columns={'cleaned_text': 'TEXT'})
+        file = file.rename(columns={'cleaned_text': 'TEXT', 'counterfactual_text': 'TEXT'})
         nan_rows = file[file.TEXT.isna()]
         if not nan_rows.empty:
             print("hospital admissionIds with NaN TEXT:", nan_rows.HADM_ID.tolist())
@@ -417,7 +416,7 @@ def main():
                         type=int,
                         help="Total batch size for training.")
     parser.add_argument("--eval_batch_size",
-                        default=32,
+                        default=64,
                         type=int,
                         help="Total batch size for eval.")
     parser.add_argument("--learning_rate",
@@ -468,8 +467,15 @@ def main():
     }
 
     if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        n_gpu = torch.cuda.device_count()
+        if torch.cuda.is_available() and not args.no_cuda:
+            device = torch.device("cuda")
+            n_gpu = torch.cuda.device_count()
+        elif torch.backends.mps.is_available() and not args.no_cuda:
+            device = torch.device("mps")
+            n_gpu = 0
+        else:
+            device = torch.device("cpu")
+            n_gpu = 0
     else:
         device = torch.device("cuda", args.local_rank)
         n_gpu = 1
@@ -733,8 +739,7 @@ def main():
         df.to_csv(os.path.join(args.output_dir, string))
         
         df_test = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
-        if 'cleaned_text' in df_test.columns:
-            df_test = df_test.rename(columns={'cleaned_text': 'TEXT'})
+        df_test = df_test.rename(columns={'cleaned_text': 'TEXT', 'counterfactual_text': 'TEXT'})
         df_test = df_test.dropna(subset=['TEXT'])
 
         df_test = df_test.reset_index(drop=True)
