@@ -317,7 +317,7 @@ def vote_score(df, score, args):
     plt.title('ROC curve')
     plt.legend(loc='best')
     plt.show()
-    string = 'auroc_clinicalbert_'+args.readmission_mode+'.png'
+    string = 'auroc_clinicalbert_discharge.png'
     plt.savefig(os.path.join(args.output_dir, string))
 
     return fpr, tpr, df_out
@@ -340,7 +340,7 @@ def pr_curve_plot(y, y_score, args):
     plt.title('Precision-Recall curve: AUC={0:0.2f}'.format(
               area))
     
-    string = 'auprc_clinicalbert_'+args.readmission_mode+'.png'
+    string = 'auprc_clinicalbert_discharge.png'
 
     plt.savefig(os.path.join(args.output_dir, string))
 
@@ -486,6 +486,8 @@ def main():
             args.fp16 = False # (see https://github.com/pytorch/pytorch/pull/13496)
     logger.info("device %s n_gpu %d distributed training %r", device, n_gpu, bool(args.local_rank != -1))
 
+    torch.backends.cudnn.benchmark = True
+
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
                             args.gradient_accumulation_steps))
@@ -502,8 +504,10 @@ def main():
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir):
-        if args.do_eval and os.path.exists(os.path.join(args.output_dir, 'eval_checkpoint.json')):
-            logger.info("Output directory exists but has eval checkpoint — resuming.")
+        has_eval_ckpt = os.path.exists(os.path.join(args.output_dir, 'eval_checkpoint.json'))
+        has_train_ckpt = os.path.exists(os.path.join(args.output_dir, 'train_checkpoint.pt'))
+        if (args.do_eval and has_eval_ckpt) or (args.do_train and has_train_ckpt):
+            logger.info("Output directory exists but has a checkpoint — resuming.")
         else:
             raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
     os.makedirs(args.output_dir, exist_ok=True)
@@ -527,8 +531,6 @@ def main():
 
     # Prepare model
     model = BertForSequenceClassification.from_pretrained(args.bert_model, 1)
-    if args.fp16:
-        model.half()
     model.to(device)
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
@@ -538,14 +540,7 @@ def main():
 
     if args.do_train:
         # Prepare optimizer
-        if args.fp16:
-            param_optimizer = [(n, param.clone().detach().to('cpu').float().requires_grad_()) \
-                                for n, param in model.named_parameters()]
-        elif args.optimize_on_cpu:
-            param_optimizer = [(n, param.clone().detach().to('cpu').requires_grad_()) \
-                                for n, param in model.named_parameters()]
-        else:
-            param_optimizer = list(model.named_parameters())
+        param_optimizer = list(model.named_parameters())
         no_decay = ['bias', 'gamma', 'beta']
         optimizer_grouped_parameters = [
             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay_rate': 0.01},
@@ -555,13 +550,18 @@ def main():
                              lr=args.learning_rate,
                              warmup=args.warmup_proportion,
                              t_total=num_train_steps)
+        scaler = torch.amp.GradScaler('cuda', enabled=args.fp16)
 
     global_step = 0
     train_loss=100000
     number_training_steps=1
     global_step_check=0
     train_loss_history=[]
-    if args.do_train:
+    final_model_path = os.path.join(args.output_dir, 'pytorch_model_new_discharge.bin')
+    if args.do_train and os.path.exists(final_model_path):
+        logger.info("Final model already exists at %s — skipping training and loading it", final_model_path)
+        model.load_state_dict(torch.load(final_model_path, map_location=device))
+    elif args.do_train:
         train_features = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer)
         logger.info("***** Running training *****")
@@ -577,45 +577,45 @@ def main():
             train_sampler = RandomSampler(train_data)
         else:
             train_sampler = DistributedSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
+        train_dataloader = DataLoader(
+            train_data, sampler=train_sampler, batch_size=args.train_batch_size,
+            num_workers=2, pin_memory=True, persistent_workers=True,
+        )
+
+        train_ckpt_path = os.path.join(args.output_dir, 'train_checkpoint.pt')
+        start_epoch = 0
+        if os.path.exists(train_ckpt_path):
+            logger.info("  Loading training checkpoint from %s", train_ckpt_path)
+            ckpt = torch.load(train_ckpt_path, map_location=device)
+            model.load_state_dict(ckpt['model_state'])
+            optimizer.load_state_dict(ckpt['optimizer_state'])
+            scaler.load_state_dict(ckpt['scaler_state'])
+            start_epoch = ckpt['epoch']
+            global_step = ckpt['global_step']
+            train_loss_history = ckpt['train_loss_history']
+            logger.info("  Resuming from epoch %d, global_step %d", start_epoch, global_step)
+
         model.train()
-        for epo in trange(int(args.num_train_epochs), desc="Epoch"):
+        for epo in trange(start_epoch, int(args.num_train_epochs), desc="Epoch"):
             tr_loss = 0
             nb_tr_examples, nb_tr_steps = 0, 0
             for step, batch in enumerate(train_dataloader):
-                batch = tuple(t.to(device) for t in batch)
+                batch = tuple(t.to(device, non_blocking=True) for t in batch)
                 input_ids, input_mask, segment_ids, label_ids = batch
-                loss, logits = model(input_ids, segment_ids, input_mask, label_ids)
+                with torch.amp.autocast('cuda', enabled=args.fp16):
+                    loss, logits = model(input_ids, segment_ids, input_mask, label_ids)
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
-                if args.fp16 and args.loss_scale != 1.0:
-                    # rescale loss for fp16 training
-                    # see https://docs.nvidia.com/deeplearning/sdk/mixed-precision-training/index.html
-                    loss = loss * args.loss_scale
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
-                loss.backward()
+                scaler.scale(loss).backward()
                 train_loss_history.append(loss.item())
                 tr_loss += loss.item()
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    if args.fp16 or args.optimize_on_cpu:
-                        if args.fp16 and args.loss_scale != 1.0:
-                            # scale down gradients for fp16 training
-                            for param in model.parameters():
-                                if param.grad is not None:
-                                    param.grad.data = param.grad.data / args.loss_scale
-                        is_nan = set_optimizer_params_grad(param_optimizer, model.named_parameters(), test_nan=True)
-                        if is_nan:
-                            logger.info("FP16 TRAINING: Nan in gradients, reducing loss scaling")
-                            args.loss_scale = args.loss_scale / 2
-                            model.zero_grad()
-                            continue
-                        optimizer.step()
-                        copy_optimizer_params_to_model(model.named_parameters(), param_optimizer)
-                    else:
-                        optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     model.zero_grad()
                     global_step += 1
                 
@@ -626,13 +626,26 @@ def main():
             train_loss=tr_loss
             global_step_check=global_step
             number_training_steps=nb_tr_steps
-            
-        string = './pytorch_model_new_'+args.readmission_mode+'.bin'
-        torch.save(model.state_dict(), string)
+
+            tmp_ckpt = train_ckpt_path + '.tmp'
+            torch.save({
+                'epoch': epo + 1,
+                'global_step': global_step,
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'scaler_state': scaler.state_dict(),
+                'train_loss_history': train_loss_history,
+            }, tmp_ckpt)
+            os.replace(tmp_ckpt, train_ckpt_path)
+            logger.info("  Saved training checkpoint after epoch %d", epo + 1)
+
+        torch.save(model.state_dict(), final_model_path)
+        if os.path.exists(train_ckpt_path):
+            os.remove(train_ckpt_path)
 
         fig1 = plt.figure()
         plt.plot(train_loss_history)
-        fig1.savefig('loss_history.png', dpi=fig1.dpi)
+        fig1.savefig(os.path.join(args.output_dir, 'loss_history.png'), dpi=fig1.dpi)
     
     m = nn.Sigmoid()
     if args.do_eval:
@@ -681,14 +694,17 @@ def main():
                 eval_sampler = SequentialSampler(eval_data)
             else:
                 eval_sampler = DistributedSampler(eval_data)
-            eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
+            eval_dataloader = DataLoader(
+                eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size,
+                num_workers=2, pin_memory=True,
+            )
 
             for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader):
-                input_ids = input_ids.to(device)
-                input_mask = input_mask.to(device)
-                segment_ids = segment_ids.to(device)
-                label_ids = label_ids.to(device)
-                with torch.no_grad():
+                input_ids = input_ids.to(device, non_blocking=True)
+                input_mask = input_mask.to(device, non_blocking=True)
+                segment_ids = segment_ids.to(device, non_blocking=True)
+                label_ids = label_ids.to(device, non_blocking=True)
+                with torch.no_grad(), torch.amp.autocast('cuda', enabled=args.fp16):
                     tmp_eval_loss, temp_logits = model(input_ids, segment_ids, input_mask, label_ids)
 
                 logits = torch.squeeze(m(temp_logits)).detach().cpu().numpy()
@@ -735,7 +751,7 @@ def main():
         eval_accuracy = eval_accuracy / nb_eval_examples
         df = pd.DataFrame({'logits':logits_history, 'pred_label': pred_labels, 'label':true_labels})
         
-        string = 'logits_clinicalbert_'+args.readmission_mode+'_chunks.csv'
+        string = 'logits_clinicalbert_discharge_chunks.csv'
         df.to_csv(os.path.join(args.output_dir, string))
         
         df_test = pd.read_csv(os.path.join(args.data_dir, "test.csv"))
@@ -748,7 +764,7 @@ def main():
 
         fpr, tpr, df_out = vote_score(df_test, logits_history, args)
         
-        string = 'logits_clinicalbert_'+args.readmission_mode+'_readmissions.csv'
+        string = 'logits_clinicalbert_discharge_readmissions.csv'
         df_out.to_csv(os.path.join(args.output_dir,string))
         
         rp80 = vote_pr_curve(df_test, logits_history, args)

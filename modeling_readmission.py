@@ -870,10 +870,8 @@ class BertForSequenceClassification(PreTrainedBertModel):
         logits = self.classifier(pooled_output2)
         
         if labels is not None:
-            loss_fct = BCELoss()
-            m = nn.Sigmoid()
-            n = torch.squeeze(m(logits))
-            loss = loss_fct(n.reshape(-1,1), labels.float().reshape(-1,1))
+            loss_fct = nn.BCEWithLogitsLoss()
+            loss = loss_fct(logits.reshape(-1,1), labels.float().reshape(-1,1))
             return loss, logits
         else:
             return logits
