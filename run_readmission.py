@@ -561,6 +561,10 @@ def main():
     if args.do_train and os.path.exists(final_model_path):
         logger.info("Final model already exists at %s — skipping training and loading it", final_model_path)
         model.load_state_dict(torch.load(final_model_path, map_location=device))
+        if not os.path.exists(os.path.join(args.output_dir, 'bert_config.json')):
+            model.config.to_json_file(os.path.join(args.output_dir, 'bert_config.json'))
+        if not os.path.exists(os.path.join(args.output_dir, 'pytorch_model.bin')):
+            torch.save(model.state_dict(), os.path.join(args.output_dir, 'pytorch_model.bin'))
     elif args.do_train:
         train_features = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer)
@@ -640,6 +644,8 @@ def main():
             logger.info("  Saved training checkpoint after epoch %d", epo + 1)
 
         torch.save(model.state_dict(), final_model_path)
+        model.config.to_json_file(os.path.join(args.output_dir, 'bert_config.json'))
+        torch.save(model.state_dict(), os.path.join(args.output_dir, 'pytorch_model.bin'))
         if os.path.exists(train_ckpt_path):
             os.remove(train_ckpt_path)
 
