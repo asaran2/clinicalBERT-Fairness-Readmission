@@ -13,21 +13,27 @@ from tqdm import tqdm
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Tune INFERENCE_BATCH_SIZE down if you hit OOM; 64 fits comfortably on A100 80GB.
-INFERENCE_BATCH_SIZE = 64
-# 500 LIME samples gives near-identical top features at half the cost.
-LIME_NUM_SAMPLES = 500
+# VRAM guide (based on ~48MB/sample observed on A100):
+#   T4  16GB (free tier) → 300
+#   V100 16GB (Pro)      → 300
+#   A100 40GB (Pro+)     → 700
+#   A100 80GB (Pro+)     → 1000
+LIME_NUM_SAMPLES = 1000
+INFERENCE_BATCH_SIZE = 1000  # 300 fits T4 (16GB); raise to 1000 on A100 80GB
+# BERT only reads ~350 words (512 subword tokens). Pre-truncate so LIME perturbs
+# a shorter string — saves perturbation generation AND tokenization work.
+MAX_WORDS_FOR_LIME = 350
 
 # Load tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 print("Tokenizer loaded")
 
 # Load fine-tuned model
-model = BertForSequenceClassification.from_pretrained('./model/discharge_readmission', 1)
+model = BertForSequenceClassification.from_pretrained('./model/exp1_discharge', 1)
 model.to(device)
 model.eval()
 
-# FP16 halves VRAM usage and runs faster on tensor cores; safe for inference.
+# FP16: halves VRAM, runs faster on tensor cores. Safe for inference.
 if device.type == 'cuda':
     model = model.half()
 
@@ -36,10 +42,16 @@ print("Model loaded and set to eval mode")
 m = nn.Sigmoid()
 
 
-def _encode(text):
-    tokens = tokenizer.tokenize(text)[:510]
-    tokens = ['[CLS]'] + tokens + ['[SEP]']
-    input_ids = tokenizer.convert_tokens_to_ids(tokens)
+def _encode_with_cache(words, word_cache):
+    """Build BERT input from a list of whitespace-split words using a subtoken cache."""
+    subtokens = ['[CLS]']
+    for word in words:
+        subtokens.extend(word_cache[word])
+        if len(subtokens) >= 511:
+            subtokens = subtokens[:511]
+            break
+    subtokens.append('[SEP]')
+    input_ids = tokenizer.convert_tokens_to_ids(subtokens)
     pad_len = 512 - len(input_ids)
     input_ids  += [0] * pad_len
     input_mask  = [1] * (512 - pad_len) + [0] * pad_len
@@ -53,24 +65,33 @@ def predictor_function(texts):
     Input: list of strings (all LIME perturbations at once)
     Output: numpy array shape (n, 2) with [P(no readmit), P(readmit)]
     """
-    all_probs = []
+    # All LIME perturbations are subsets of the same source text, so they share
+    # the same ~350 unique words. Build a word→subtoken cache once instead of
+    # calling tokenizer.tokenize() ~175,000 times (once per word per perturbation).
+    word_cache = {}
+    for text in texts:
+        for word in text.split():
+            if word not in word_cache:
+                word_cache[word] = tokenizer.tokenize(word)
+
+    all_probs = np.empty((len(texts), 2), dtype=np.float32)
+
     with torch.no_grad():
         for i in range(0, len(texts), INFERENCE_BATCH_SIZE):
-            batch = texts[i : i + INFERENCE_BATCH_SIZE]
-            encoded = [_encode(t) for t in batch]
+            batch_words = [texts[j].split() for j in range(i, min(i + INFERENCE_BATCH_SIZE, len(texts)))]
+            encoded = [_encode_with_cache(words, word_cache) for words in batch_words]
 
-            ids  = torch.tensor([e[0] for e in encoded], dtype=torch.long).to(device)
-            seg  = torch.tensor([e[1] for e in encoded], dtype=torch.long).to(device)
-            mask = torch.tensor([e[2] for e in encoded], dtype=torch.long).to(device)
+            ids  = torch.tensor([e[0] for e in encoded], dtype=torch.long).to(device, non_blocking=True)
+            seg  = torch.tensor([e[1] for e in encoded], dtype=torch.long).to(device, non_blocking=True)
+            mask = torch.tensor([e[2] for e in encoded], dtype=torch.long).to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                logits = model(ids, seg, mask)
-
+            logits = model(ids, seg, mask)
             probs = m(logits.float()).squeeze(-1).cpu().numpy()
-            for p1 in probs:
-                all_probs.append([1.0 - float(p1), float(p1)])
 
-    return np.array(all_probs)
+            all_probs[i : i + len(probs), 1] = probs
+            all_probs[i : i + len(probs), 0] = 1.0 - probs
+
+    return all_probs
 
 
 explainer = LimeTextExplainer(class_names=['No Readmit', 'Readmit'])
@@ -103,9 +124,13 @@ for file_path in csv_files:
         if pd.isna(chunk_text) or str(chunk_text).strip() == '':
             continue
 
+        # Truncate to MAX_WORDS_FOR_LIME words. BERT only sees ~350 words anyway,
+        # so LIME perturbing text beyond that is wasted string + tokenization work.
+        truncated_text = ' '.join(str(chunk_text).split()[:MAX_WORDS_FOR_LIME])
+
         try:
             explanation = explainer.explain_instance(
-                str(chunk_text),
+                truncated_text,
                 predictor_function,
                 num_features=20,
                 num_samples=LIME_NUM_SAMPLES,
